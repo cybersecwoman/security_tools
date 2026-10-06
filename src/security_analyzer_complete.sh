@@ -8,15 +8,20 @@
 # Configuração inicial
 set -euo pipefail  # Modo strict
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Diretório base fixo para os 'source' abaixo. Os módulos carregados redefinem
+# a variável SCRIPT_DIR ao serem sourced, então usamos uma variável dedicada
+# que não é sobrescrita para montar os caminhos corretamente.
+__BASE_DIR="$SCRIPT_DIR"
 
 # Carregar configurações e módulos
-source "$SCRIPT_DIR/config.conf"
-source "$SCRIPT_DIR/utils/security.sh"
-source "$SCRIPT_DIR/utils/logger.sh"
-source "$SCRIPT_DIR/modules/api_manager.sh"
-source "$SCRIPT_DIR/modules/report_generator.sh"
-source "$SCRIPT_DIR/analyzers/file_analyzer.sh"
-source "$SCRIPT_DIR/analyzers/url_analyzer.sh"
+source "$__BASE_DIR/config.conf"
+source "$__BASE_DIR/utils/security.sh"
+source "$__BASE_DIR/utils/logger.sh"
+source "$__BASE_DIR/modules/api_manager.sh"
+source "$__BASE_DIR/modules/report_generator.sh"
+source "$__BASE_DIR/analyzers/file_analyzer.sh"
+source "$__BASE_DIR/analyzers/url_analyzer.sh"
+source "$__BASE_DIR/analyzers/email_header_analyzer.sh"
 
 # Cores para interface (se habilitadas)
 if [[ "$ENABLE_COLORS" == "true" ]]; then
@@ -131,6 +136,7 @@ show_main_menu() {
     echo -e "${GREEN}  [3] 🏠 Analisar Domínio${NC}         - Investigação de domínios"
     echo -e "${GREEN}  [4] 🔢 Analisar Hash${NC}            - Consulta em bases de dados"
     echo -e "${GREEN}  [5] 📧 Analisar Email${NC}           - Verificação de endereços"
+    echo -e "${GREEN}  [15] 📨 Analisar Header de Email${NC} - Análise forense de phishing/spoofing"
     echo -e "${GREEN}  [6] 🌐 Analisar IP${NC}             - Análise de endereços IP"
     echo ""
     echo -e "${BLUE}  CONFIGURAÇÃO E RELATÓRIOS${NC}"
@@ -1207,6 +1213,9 @@ main_loop() {
                     ;;
                 5)
                     analyze_email_interactive
+                    ;;
+                15)
+                    analyze_email_header_interactive
                     ;;
                 6)
                     analyze_ip_interactive

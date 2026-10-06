@@ -105,6 +105,7 @@ show_main_menu() {
     echo -e "${GREEN}  [3] 🏠 Analisar Domínio${NC}         - Investigação de domínios"
     echo -e "${GREEN}  [4] 🔢 Analisar Hash${NC}            - Consulta em bases de dados"
     echo -e "${GREEN}  [5] 📧 Analisar Email${NC}           - Verificação de endereços"
+    echo -e "${GREEN}  [15] 📨 Analisar Header de Email${NC} - Análise forense de phishing/spoofing"
     echo -e "${GREEN}  [6] 🌐 Analisar IP${NC}             - Análise de endereços IP"
     echo ""
     echo -e "${BLUE}  [7] ⚙️  Configurar APIs${NC}          - Gerenciar chaves de acesso"
@@ -484,6 +485,429 @@ analyze_email() {
     log_message "Email analisado: $email"
 }
 
+# Análise de Header de Email (forense de phishing/spoofing)
+analyze_email_header() {
+    # Esta função usa muitos condicionais '[[ ... ]] && cmd' onde a condição
+    # falsa é fluxo normal (não erro). Desligamos 'errexit' localmente para
+    # não abortar sob o 'set -e' global do script.
+    set +e
+    echo -e "${CYAN}📨 ANÁLISE DE EMAIL (Show Original / .eml)${NC}"
+    echo "=========================================="
+    echo ""
+    echo "Você pode:"
+    echo "  (a) Informar o CAMINHO de um arquivo .eml/.txt na primeira linha, ou"
+    echo "  (b) COLAR o conteúdo completo (header + corpo) do 'Show Original'."
+    echo -e "Para colar, termine digitando ${YELLOW}FIM${NC} em uma linha sozinha:"
+    echo ""
+
+    local header_content=""
+    local line first_line_checked=0
+    while IFS= read -r line; do
+        [[ "$line" == "FIM" || "$line" == "fim" || "$line" == "END" ]] && break
+        if [[ "$first_line_checked" -eq 0 ]]; then
+            first_line_checked=1
+            local trimmed="${line#"${line%%[![:space:]]*}"}"
+            trimmed="${trimmed%"${trimmed##*[![:space:]]}"}"
+            if [[ -n "$trimmed" && -f "$trimmed" && -r "$trimmed" ]]; then
+                echo -e "${YELLOW}📂 Lendo arquivo: $trimmed${NC}"
+                header_content=$(cat "$trimmed")
+                break
+            fi
+        fi
+        header_content+="$line"$'\n'
+    done
+
+    if [[ -z "${header_content//[$'\n\t ']/}" ]]; then
+        echo -e "${RED}❌ Nenhum conteúdo fornecido${NC}"
+        return 1
+    fi
+
+    if ! echo "$header_content" | grep -qiE "^(From|Received|Return-Path|Message-ID|Authentication-Results):"; then
+        echo -e "${RED}❌ O conteúdo não parece um email válido${NC}"
+        return 1
+    fi
+
+    echo ""
+    echo -e "${YELLOW}🔍 Analisando (header + corpo)...${NC}"
+    echo ""
+
+    # --- Helpers locais ---
+    _hdr_field() {
+        local field="$1"
+        echo "$header_content" | awk -v f="$field" '
+            BEGIN { IGNORECASE = 1; found = 0 }
+            {
+                if (found) {
+                    if ($0 ~ /^[ \t]+/) { line=$0; sub(/^[ \t]+/," ",line); printf "%s", line; next }
+                    else { print ""; exit }
+                }
+                if ($0 ~ "^" f ":") { val=$0; sub("^" f ":[ \t]*","",val); printf "%s", val; found=1 }
+            }
+            END { if (found) print "" }'
+    }
+    _hdr_addr() {
+        local value="$1" addr
+        addr=$(echo "$value" | grep -oE '<[^>]+@[^>]+>' | head -1 | tr -d '<>')
+        [[ -z "$addr" ]] && addr=$(echo "$value" | grep -oE '[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | head -1)
+        echo "$addr"
+    }
+    _hdr_domain() { echo "$1" | sed -n 's/.*@//p' | tr '[:upper:]' '[:lower:]'; }
+    _is_private_ip() {
+        local ip="$1"
+        [[ "$ip" =~ ^10\. || "$ip" =~ ^192\.168\. || "$ip" =~ ^172\.(1[6-9]|2[0-9]|3[0-1])\. || "$ip" =~ ^127\. || "$ip" =~ ^169\.254\. ]]
+    }
+
+    local from_raw=$(_hdr_field "From")
+    local to_raw=$(_hdr_field "To")
+    local return_path=$(_hdr_field "Return-Path")
+    local reply_to=$(_hdr_field "Reply-To")
+    local subject=$(_hdr_field "Subject")
+    local date_field=$(_hdr_field "Date")
+    local message_id=$(_hdr_field "Message-ID")
+    local x_mailer=$(_hdr_field "X-Mailer")
+    local auth_results=$(_hdr_field "Authentication-Results")
+    local received_spf=$(_hdr_field "Received-SPF")
+    local dkim_sig=$(_hdr_field "DKIM-Signature")
+
+    local from_addr=$(_hdr_addr "$from_raw")
+    local from_domain=$(_hdr_domain "$from_addr")
+    local return_domain=$(_hdr_domain "$(_hdr_addr "$return_path")")
+    local reply_domain=$(_hdr_domain "$(_hdr_addr "$reply_to")")
+
+    local risk_score=0
+
+    # 1. Campos principais
+    echo -e "${BLUE}[🔍 Campos Principais]${NC}"
+    [[ -n "$from_raw" ]]    && echo "From: $from_raw"
+    [[ -n "$to_raw" ]]      && echo "To: $to_raw"
+    [[ -n "$return_path" ]] && echo "Return-Path: $return_path"
+    [[ -n "$reply_to" ]]    && echo "Reply-To: $reply_to"
+    [[ -n "$subject" ]]     && echo "Subject: $subject"
+    [[ -n "$date_field" ]]  && echo "Date: $date_field"
+    [[ -n "$message_id" ]]  && echo "Message-ID: $message_id"
+    [[ -n "$x_mailer" ]]    && echo "X-Mailer: $x_mailer"
+    [[ -n "$from_domain" ]] && echo "Domínio do remetente: $from_domain"
+
+    if [[ -n "$x_mailer" ]] && echo "$x_mailer" | grep -qiE "PHP ?Mailer|Mass Mailing|bulk"; then
+        echo -e "${YELLOW}⚠️  X-Mailer suspeito (envio em massa)${NC}"
+        risk_score=$((risk_score + 15))
+    fi
+    if [[ -n "$subject" ]] && echo "$subject" | grep -qiE "urgent|immediate action|account.*(suspend|compromis|lock|block)|verify your account|password.*(expir|reset)|unusual activity|security alert"; then
+        echo -e "${YELLOW}⚠️  Assunto com padrão típico de phishing${NC}"
+        risk_score=$((risk_score + 10))
+    fi
+
+    # 2. Autenticação
+    echo ""
+    echo -e "${BLUE}[🔐 Autenticação do Remetente]${NC}"
+    local spf_status=""
+    [[ -n "$auth_results" ]] && spf_status=$(echo "$auth_results" | grep -oiE "spf=[a-z]+" | head -1 | cut -d'=' -f2 | tr '[:upper:]' '[:lower:]')
+    [[ -z "$spf_status" && -n "$received_spf" ]] && spf_status=$(echo "$received_spf" | awk '{print tolower($1)}')
+    case "$spf_status" in
+        pass) echo "✅ SPF: pass" ;;
+        fail) echo -e "${RED}🚨 SPF: fail (remetente não autorizado - possível spoofing)${NC}"; risk_score=$((risk_score + 30)) ;;
+        softfail|neutral|none) echo -e "${YELLOW}⚠️  SPF: $spf_status${NC}"; risk_score=$((risk_score + 15)) ;;
+        "") echo "❓ SPF: não encontrado" ;;
+        *) echo -e "${YELLOW}⚠️  SPF: $spf_status${NC}" ;;
+    esac
+
+    local dkim_status=""
+    [[ -n "$auth_results" ]] && dkim_status=$(echo "$auth_results" | grep -oiE "dkim=[a-z]+" | head -1 | cut -d'=' -f2 | tr '[:upper:]' '[:lower:]')
+    case "$dkim_status" in
+        pass) echo "✅ DKIM: pass" ;;
+        fail) echo -e "${RED}🚨 DKIM: fail (assinatura inválida)${NC}"; risk_score=$((risk_score + 20)) ;;
+        none) echo -e "${YELLOW}⚠️  DKIM: none${NC}"; risk_score=$((risk_score + 10)) ;;
+        "") [[ -n "$dkim_sig" ]] && echo "❓ DKIM: assinatura presente, sem resultado" || { echo -e "${YELLOW}⚠️  DKIM: não encontrado${NC}"; risk_score=$((risk_score + 10)); } ;;
+        *) echo -e "${YELLOW}⚠️  DKIM: $dkim_status${NC}" ;;
+    esac
+    if [[ -n "$dkim_sig" ]]; then
+        local dkim_domain=$(echo "$dkim_sig" | grep -oiE "d=[a-zA-Z0-9.-]+" | head -1 | cut -d'=' -f2)
+        [[ -n "$dkim_domain" ]] && echo "   Domínio assinante (DKIM d=): $dkim_domain"
+    fi
+
+    local dmarc_status=""
+    [[ -n "$auth_results" ]] && dmarc_status=$(echo "$auth_results" | grep -oiE "dmarc=[a-z]+" | head -1 | cut -d'=' -f2 | tr '[:upper:]' '[:lower:]')
+    case "$dmarc_status" in
+        pass) echo "✅ DMARC: pass" ;;
+        fail) echo -e "${RED}🚨 DMARC: fail (desalinhamento - forte indício de spoofing)${NC}"; risk_score=$((risk_score + 30)) ;;
+        none) echo -e "${YELLOW}⚠️  DMARC: none${NC}"; risk_score=$((risk_score + 10)) ;;
+        "") echo "❓ DMARC: não encontrado" ;;
+        *) echo -e "${YELLOW}⚠️  DMARC: $dmarc_status${NC}" ;;
+    esac
+    local dmarc_from=""
+    if [[ -n "$auth_results" ]]; then
+        dmarc_from=$(echo "$auth_results" | grep -oiE "header.from=[a-zA-Z0-9.-]+" | head -1 | cut -d'=' -f2 | tr '[:upper:]' '[:lower:]')
+        [[ -n "$dmarc_from" ]] && echo "   DMARC header.from: $dmarc_from"
+    fi
+
+    # 3. Rota (Received) e IPs
+    echo ""
+    echo -e "${BLUE}[🛤️  Rota de Entrega (Received)]${NC}"
+    local hop_count=$(echo "$header_content" | grep -ciE "^Received:")
+    echo "Número de servidores (hops): $hop_count"
+    if [[ "$hop_count" -gt 0 ]]; then
+        local ips=$(echo "$header_content" | grep -iE "^Received:|^Received-SPF:|^Authentication-Results:" | grep -oE '([0-9]{1,3}\.){3}[0-9]{1,3}' | sort -u)
+        if [[ -n "$ips" ]]; then
+            echo "Endereços IP identificados:"
+            while IFS= read -r ip; do
+                [[ -z "$ip" ]] && continue
+                if _is_private_ip "$ip"; then echo "  • $ip (privado/interno)"; else echo "  • $ip (público)"; fi
+            done <<< "$ips"
+        fi
+    fi
+
+    # 4. Inconsistências
+    echo ""
+    echo -e "${BLUE}[🕵️  Detecção de Inconsistências]${NC}"
+    local issues=0
+    if [[ -n "$from_domain" && -n "$return_domain" ]]; then
+        if [[ "$from_domain" != "$return_domain" ]]; then
+            echo -e "${RED}🚨 From ($from_domain) difere do Return-Path ($return_domain)${NC}"
+            risk_score=$((risk_score + 20)); issues=$((issues + 1))
+        else
+            echo "✅ From e Return-Path usam o mesmo domínio ($from_domain)"
+        fi
+    fi
+    if [[ -n "$from_domain" && -n "$reply_domain" && "$from_domain" != "$reply_domain" ]]; then
+        echo -e "${YELLOW}⚠️  Reply-To ($reply_domain) difere do From ($from_domain)${NC}"
+        issues=$((issues + 1))
+    fi
+    if [[ -n "$dmarc_from" && -n "$from_domain" && "$dmarc_from" != "$from_domain" ]]; then
+        echo -e "${RED}🚨 DMARC header.from ($dmarc_from) difere do From ($from_domain) - desalinhamento${NC}"
+        risk_score=$((risk_score + 20)); issues=$((issues + 1))
+    fi
+    [[ "$issues" -eq 0 ]] && echo "✅ Nenhuma inconsistência evidente entre os campos de identidade"
+
+    # 5. Análise de Links e Domínios (online)
+    echo ""
+    echo -e "${BLUE}[🔗 Links e Domínios (análise online)]${NC}"
+
+    # Listas de apoio
+    local SUSPICIOUS_TLDS="tk ml ga cf gq pw top click download zip mov xyz country kim work link"
+    local SHORTENERS="bit.ly tinyurl.com goo.gl t.co ow.ly is.gd buff.ly rebrand.ly cutt.ly rb.gy shorturl.at tiny.cc"
+    local BRANDS="paypal microsoft google apple amazon netflix bank bradesco itau santander nubank caixa correios"
+
+    # Heurísticas offline sobre um host. Saída em stdout: "flags|score".
+    _check_host() {
+        local host; host=$(echo "$1" | tr '[:upper:]' '[:lower:]')
+        local flags="" score=0 t s b tld dots
+        if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+            flags+="IP-como-host; "; score=$((score + 25))
+        fi
+        if [[ "$host" == xn--* || "$host" == *.xn--* ]]; then
+            flags+="punycode/IDN; "; score=$((score + 20))
+        fi
+        tld="${host##*.}"
+        for t in $SUSPICIOUS_TLDS; do
+            [[ "$tld" == "$t" ]] && { flags+="TLD suspeito .$tld; "; score=$((score + 15)); break; }
+        done
+        for s in $SHORTENERS; do
+            [[ "$host" == "$s" || "$host" == *".$s" ]] && { flags+="encurtador ($s); "; score=$((score + 15)); break; }
+        done
+        for b in $BRANDS; do
+            if echo "$host" | grep -qi "$b" && ! echo "$host" | grep -qiE "(^|\.)$b\.(com|net|org|com\.br)$"; then
+                flags+="possível typosquatting de '$b'; "; score=$((score + 20)); break
+            fi
+        done
+        dots="${host//[^.]/}"
+        [[ ${#dots} -ge 4 ]] && { flags+="muitos subdomínios; "; score=$((score + 10)); }
+        echo "${flags}|${score}"
+    }
+
+    # DNS + idade WHOIS. Saída em stdout: "ip|score|note".
+    _check_domain_online() {
+        local domain="$1" ip="" score=0 note="" created cre_s days
+        if command -v dig &>/dev/null; then
+            ip=$(dig +short "$domain" 2>/dev/null | grep -E '^[0-9]' | head -1)
+        fi
+        [[ -z "$ip" ]] && { note+="não resolve em DNS; "; score=$((score + 10)); }
+        if command -v whois &>/dev/null; then
+            created=$(timeout 10 whois "$domain" 2>/dev/null | grep -iE "creation date|created|registered on" | head -1 | grep -oE '[0-9]{4}-[0-9]{2}-[0-9]{2}')
+            if [[ -n "$created" ]]; then
+                cre_s=$(date -d "$created" +%s 2>/dev/null || echo "")
+                if [[ -n "$cre_s" ]]; then
+                    days=$(( ( $(date +%s) - cre_s ) / 86400 ))
+                    if [[ $days -lt 90 ]]; then
+                        note+="criado há ${days}d (RECENTE); "; score=$((score + 15))
+                    else
+                        note+="criado em $created; "
+                    fi
+                fi
+            fi
+        fi
+        echo "${ip}|${score}|${note}"
+    }
+
+    local urls id_domains d host hres dres flags ip note http_code redirect
+    urls=$(echo "$header_content" | grep -oiE 'https?://[a-zA-Z0-9./?=_%:+~#-]+' | sed 's/[).,;>"'"'"']*$//' | sort -u)
+    id_domains=$(printf "%s\n%s\n%s\n" "$from_domain" "$return_domain" "$reply_domain" | grep -vE '^$' | sort -u)
+
+    # 5a. Domínios de identidade
+    if [[ -n "$id_domains" ]]; then
+        echo "Domínios de identidade (From/Return-Path/Reply-To):"
+        while IFS= read -r d; do
+            [[ -z "$d" ]] && continue
+            hres=$(_check_host "$d"); flags="${hres%|*}"
+            dres=$(_check_domain_online "$d"); ip="${dres%%|*}"; note="${dres##*|}"
+            local line="  • $d"
+            [[ -n "$ip" ]] && line+=" → $ip"
+            echo "$line"
+            [[ -n "$flags" ]] && { echo -e "    ${YELLOW}⚠️  $flags${NC}"; risk_score=$((risk_score + ${hres##*|})); }
+            [[ -n "$note" ]] && echo -e "    ${YELLOW}ℹ️  $note${NC}"
+            dres="${dres#*|}"; risk_score=$((risk_score + ${dres%|*}))
+        done <<< "$id_domains"
+    fi
+
+    # 5b. Links encontrados no header
+    if [[ -n "$urls" ]]; then
+        echo ""
+        echo "Links encontrados no header:"
+        while IFS= read -r url; do
+            [[ -z "$url" ]] && continue
+            host=$(echo "$url" | sed -E 's#^https?://##; s#/.*$##; s#:.*$##; s#.*@##')
+            echo "  🔗 $url"
+            [[ "$url" == http://* ]] && { echo -e "    ${YELLOW}⚠️  HTTP sem criptografia${NC}"; risk_score=$((risk_score + 5)); }
+            echo "$url" | grep -qE '://[^/]*@' && { echo -e "    ${RED}🚨 contém '@' (destino real ofuscado)${NC}"; risk_score=$((risk_score + 20)); }
+            hres=$(_check_host "$host"); flags="${hres%|*}"
+            [[ -n "$flags" ]] && { echo -e "    ${YELLOW}⚠️  $flags${NC}"; risk_score=$((risk_score + ${hres##*|})); }
+            dres=$(_check_domain_online "$host"); ip="${dres%%|*}"; note="${dres##*|}"
+            [[ -n "$ip" ]] && echo "    DNS: $host → $ip"
+            [[ -n "$note" ]] && echo "    WHOIS: $note"
+            dres="${dres#*|}"; risk_score=$((risk_score + ${dres%|*}))
+            if command -v curl &>/dev/null; then
+                http_code=$(curl -s -o /dev/null -w "%{http_code}" --connect-timeout 8 --max-time 12 "$url" 2>/dev/null)
+                [[ -n "$http_code" && "$http_code" != "000" ]] && echo "    HTTP: $http_code"
+                if [[ "$http_code" =~ ^30 ]]; then
+                    redirect=$(curl -s -I --connect-timeout 8 --max-time 12 "$url" 2>/dev/null | grep -i '^location:' | head -1 | cut -d' ' -f2- | tr -d '\r')
+                    [[ -n "$redirect" ]] && echo -e "    ${YELLOW}🔄 redireciona para: $redirect${NC}"
+                fi
+            fi
+        done <<< "$urls"
+    else
+        echo ""
+        echo "Nenhum link http(s) encontrado no header."
+    fi
+
+    # 5.5 Análise do corpo do email (MIME)
+    echo ""
+    echo -e "${BLUE}[📄 Corpo do Email (MIME)]${NC}"
+    if echo "$header_content" | grep -qiE "^Content-Type:|^Content-Transfer-Encoding:|boundary="; then
+        local body
+        body=$(echo "$header_content" | awk 'BEGIN{b=0} /^[[:space:]]*$/{if(!b){b=1;next}} {if(b)print}')
+
+        local ctypes
+        ctypes=$(echo "$header_content" | grep -oiE "Content-Type:[ ]*[a-zA-Z0-9._/+-]+" | sed -E 's/Content-Type:[ ]*//I' | sort -u | tr '\n' ' ')
+        [[ -n "$ctypes" ]] && echo "Tipos de conteúdo: $ctypes"
+        local has_html="não"; echo "$header_content" | grep -qiE "Content-Type:[ ]*text/html" && has_html="sim" || true
+        local has_text="não"; echo "$header_content" | grep -qiE "Content-Type:[ ]*text/plain" && has_text="sim" || true
+        echo "Parte texto: $has_text | Parte HTML: $has_html"
+
+        # URLs do corpo
+        echo ""
+        echo -e "${BLUE}[🔗 URLs no corpo]${NC}"
+        local body_urls bu bhost bhres bdres bflags bip bnote
+        body_urls=$(echo "$body" | grep -oiE 'https?://[a-zA-Z0-9./?=_%:&+~#@-]+' | sed 's/[").,;>"'"'"']*$//' | sort -u)
+        if [[ -n "$body_urls" ]]; then
+            while IFS= read -r bu; do
+                [[ -z "$bu" ]] && continue
+                bhost=$(echo "$bu" | sed -E 's#^https?://##; s#/.*$##; s#:.*$##; s#.*@##')
+                echo "  🔗 $bu"
+                [[ "$bu" == http://* ]] && { echo -e "    ${YELLOW}⚠️  HTTP sem criptografia${NC}"; risk_score=$((risk_score + 5)); }
+                echo "$bu" | grep -qE '://[^/]*@' && { echo -e "    ${RED}🚨 contém '@' (destino ofuscado)${NC}"; risk_score=$((risk_score + 20)); } || true
+                bhres=$(_check_host "$bhost"); bflags="${bhres%|*}"
+                [[ -n "$bflags" ]] && { echo -e "    ${YELLOW}⚠️  $bflags${NC}"; risk_score=$((risk_score + ${bhres##*|})); }
+                bdres=$(_check_domain_online "$bhost"); bip="${bdres%%|*}"; bnote="${bdres##*|}"
+                [[ -n "$bip" ]] && echo "    DNS: $bhost → $bip"
+                [[ -n "$bnote" ]] && echo "    WHOIS: $bnote"
+                bdres="${bdres#*|}"; risk_score=$((risk_score + ${bdres%|*}))
+            done <<< "$body_urls"
+
+            # Texto visível vs destino em links HTML
+            local anchor href_host text text_host
+            while IFS= read -r anchor; do
+                [[ -z "$anchor" ]] && continue
+                href_host=$(echo "$anchor" | grep -oiE 'href="https?://[^"]+"' | head -1 | sed -E 's/href="https?:\/\///I; s#[/"].*$##')
+                text=$(echo "$anchor" | sed -E 's/<[^>]+>//g')
+                text_host=$(echo "$text" | grep -oiE '[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}' | head -1)
+                if [[ -n "$text_host" && -n "$href_host" ]] && ! echo "$href_host" | grep -qi "$text_host"; then
+                    echo -e "    ${RED}🚨 Link exibe '$text_host' mas aponta para '$href_host'${NC}"
+                    risk_score=$((risk_score + 25))
+                fi
+            done < <(echo "$body" | grep -oiE '<a[^>]+href="https?://[^"]+"[^>]*>[^<]+</a>')
+        else
+            echo "  Nenhuma URL encontrada no corpo."
+        fi
+
+        # Imagens embutidas (Base64) + hash
+        echo ""
+        echo -e "${BLUE}[🖼️  Imagens]${NC}"
+        local btmp="${TEMP_DIR:-/tmp}/email_body_$$"
+        mkdir -p "$btmp" 2>/dev/null
+        echo "$header_content" > "$btmp/parts.txt"
+        local img_count=0 img_info iext ib64 ifpath isha imd5 isize
+        img_info=$(awk '
+            BEGIN{IGNORECASE=1; inimg=0; inhdr=0; indata=0; data=""; ctype=""}
+            /^Content-Type:[ ]*image\//{ ctype=$0; sub(/.*image\//,"",ctype); sub(/[;].*/,"",ctype); gsub(/[ \t\r]/,"",ctype); inimg=1; inhdr=1; indata=0; data=""; next }
+            inimg && inhdr { if ($0 ~ /^[[:space:]]*$/) { inhdr=0; indata=1 } next }
+            inimg && indata {
+                if ($0 ~ /^[[:space:]]*$/ || $0 ~ /^--/) { if (data!=""){print ctype "\t" data}; inimg=0; indata=0; data=""; ctype=""; next }
+                line=$0; gsub(/[ \t\r]/,"",line); data=data line
+            }
+            END{if(data!=""){print ctype "\t" data}}
+        ' "$btmp/parts.txt")
+        if [[ -n "$img_info" ]]; then
+            while IFS=$'\t' read -r iext ib64; do
+                [[ -z "$ib64" ]] && continue
+                img_count=$((img_count + 1))
+                ifpath="$btmp/img_${img_count}.${iext:-bin}"
+                echo "$ib64" | base64 -d > "$ifpath" 2>/dev/null
+                if [[ -s "$ifpath" ]]; then
+                    isize=$(stat -c%s "$ifpath" 2>/dev/null || echo "0")
+                    isha=$(sha256sum "$ifpath" 2>/dev/null | cut -d' ' -f1)
+                    imd5=$(md5sum "$ifpath" 2>/dev/null | cut -d' ' -f1)
+                    echo "  Imagem #$img_count (image/$iext, ${isize} bytes)"
+                    echo "    SHA256: $isha"
+                    echo "    MD5:    $imd5"
+                else
+                    echo "  Imagem #$img_count: falha ao decodificar Base64"
+                fi
+            done <<< "$img_info"
+        fi
+        # Imagens remotas
+        local remote_imgs ri
+        remote_imgs=$(echo "$body" | grep -oiE '<img[^>]+src="https?://[^"]+"' | grep -oiE 'https?://[^"]+' | sort -u)
+        if [[ -n "$remote_imgs" ]]; then
+            while IFS= read -r ri; do
+                [[ -z "$ri" ]] && continue
+                img_count=$((img_count + 1))
+                echo "  Imagem remota: $ri"
+                if echo "$body" | grep -qiE "<img[^>]+src=\"${ri//\//\\/}\"[^>]*(width=\"?1\"?|height=\"?1\"?)"; then
+                    echo -e "    ${YELLOW}⚠️  possível tracking pixel (1x1)${NC}"
+                fi
+            done <<< "$remote_imgs"
+        fi
+        [[ "$img_count" -eq 0 ]] && echo "  Nenhuma imagem detectada."
+        rm -rf "$btmp" 2>/dev/null
+    else
+        echo "Corpo MIME não detectado (parece ser apenas o header)."
+    fi
+
+    # 6. Avaliação de risco
+    echo ""
+    echo -e "${BLUE}[⚖️  Avaliação de Risco]${NC}"
+    local risk_level
+    if [[ $risk_score -ge 50 ]]; then risk_level="ALTO"
+    elif [[ $risk_score -ge 25 ]]; then risk_level="MÉDIO"
+    else risk_level="BAIXO"; fi
+    case "$risk_level" in
+        "ALTO")  echo -e "${RED}🔴 RISCO ALTO - fortes indícios de phishing/spoofing${NC}"; echo "   NÃO clique em links, NÃO responda, NÃO forneça dados" ;;
+        "MÉDIO") echo -e "${YELLOW}🟡 RISCO MÉDIO - sinais suspeitos${NC}"; echo "   Verifique o remetente por outro canal antes de interagir" ;;
+        "BAIXO") echo -e "${GREEN}🟢 RISCO BAIXO - autenticação consistente${NC}"; echo "   Mantenha atenção normal a conteúdo e anexos" ;;
+    esac
+
+    log_message "Header de email analisado: ${from_addr:-desconhecido} (risco=$risk_level, score=$risk_score)"
+}
+
 # Análise de IP
 analyze_ip() {
     echo -e "${CYAN}🌐 ANÁLISE DE ENDEREÇO IP${NC}"
@@ -789,6 +1213,9 @@ main_loop() {
                 ;;
             5)
                 analyze_email
+                ;;
+            15)
+                analyze_email_header
                 ;;
             6)
                 analyze_ip
